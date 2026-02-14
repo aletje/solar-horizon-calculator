@@ -27,7 +27,6 @@ from reportlab.lib.pagesizes import A4
 
 EARTH_RADIUS_M = 6_371_000.0
 SUN_RADIUS_DEG = 0.2665       # Angular radius of the sun (~0.533° diameter / 2)
-REFRACTION_DEG = 0.567         # Standard atmospheric refraction at the horizon
 LAT_METERS_PER_DEG = 111_320.0  # Approximate meters per degree of latitude
 
 
@@ -48,6 +47,7 @@ class SolarCalcConfig:
     timezone: str = "Europe/Oslo"
     start_date: date = field(default_factory=lambda: date(2025, 1, 1))
     end_date: date = field(default_factory=lambda: date(2025, 12, 31))
+    temperature_file: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +279,7 @@ def compute_horizon_profile(
 # ---------------------------------------------------------------------------
 
 def bisect_crossing(observer, sun, t_before, t_after, horizon_az_ext,
-                    horizon_alt_ext, rising=True, iterations=20):
+                    horizon_alt_ext, refraction_deg, rising=True, iterations=20):
     """
     Binary search for the exact moment the sun crosses the local horizon.
 
@@ -288,6 +288,7 @@ def bisect_crossing(observer, sun, t_before, t_after, horizon_az_ext,
         sun: Skyfield sun object
         t_before, t_after: Skyfield Time bounds
         horizon_az_ext, horizon_alt_ext: Extended horizon profile arrays
+        refraction_deg: Atmospheric refraction angle in degrees
         rising: True for sunrise (negative->positive), False for sunset
         iterations: Number of bisection iterations
 
@@ -298,7 +299,7 @@ def bisect_crossing(observer, sun, t_before, t_after, horizon_az_ext,
         t_mid = t_before + (t_after - t_before) / 2
         alt_mid, az_mid, _ = observer.at(t_mid).observe(sun).apparent().altaz()
         hor_alt_mid = np.interp(az_mid.degrees, horizon_az_ext, horizon_alt_ext)
-        diff_mid = alt_mid.degrees + SUN_RADIUS_DEG + REFRACTION_DEG - hor_alt_mid
+        diff_mid = alt_mid.degrees + SUN_RADIUS_DEG + refraction_deg - hor_alt_mid
         if abs(diff_mid) < 1e-4:
             break
         if rising:
@@ -325,10 +326,21 @@ def find_sunrise_sunset(
     obs_offset: float,
     horizon_az: np.ndarray,
     horizon_alt: np.ndarray,
-    target_date: date
+    target_date: date,
+    refraction_deg: float = 0.575  # 34.5 arcmin standard refraction at 10°C, 1013.25 hPa
 ):
     """
     Computes local sunrise and sunset times given a horizon profile.
+
+    Parameters:
+        observer_lat: Latitude in degrees
+        observer_lon: Longitude in degrees
+        observer_elev: Observer elevation in meters
+        obs_offset: Observer height offset in meters (e.g., eye level)
+        horizon_az: Array of azimuth angles in degrees
+        horizon_alt: Array of horizon altitude angles in degrees
+        target_date: Date for which to compute sunrise/sunset
+        refraction_deg: Atmospheric refraction angle in degrees (default: 0.575° = 34.5')
 
     Returns:
         (sunrise_utc, sunset_utc) — datetimes in UTC, or
@@ -361,7 +373,7 @@ def find_sunrise_sunset(
     horizon_at_sun = np.interp(az_deg, horizon_az_extended, horizon_alt_extended)
 
     # Include sun radius AND atmospheric refraction
-    diff = alt_deg + SUN_RADIUS_DEG + REFRACTION_DEG - horizon_at_sun
+    diff = alt_deg + SUN_RADIUS_DEG + refraction_deg - horizon_at_sun
 
     sunrise_time = None
     sunset_time = None
@@ -371,7 +383,7 @@ def find_sunrise_sunset(
         if diff[i] >= 0 and diff[i - 1] < 0:
             sunrise_time = bisect_crossing(
                 observer, sun, times[i - 1], times[i],
-                horizon_az_extended, horizon_alt_extended, rising=True
+                horizon_az_extended, horizon_alt_extended, refraction_deg, rising=True
             )
             break
 
@@ -380,7 +392,7 @@ def find_sunrise_sunset(
         if diff[i] < 0 and diff[i - 1] >= 0:
             sunset_time = bisect_crossing(
                 observer, sun, times[i - 1], times[i],
-                horizon_az_extended, horizon_alt_extended, rising=False
+                horizon_az_extended, horizon_alt_extended, refraction_deg, rising=False
             )
             break
 
@@ -489,6 +501,9 @@ def export_to_pdf(rows, filename, start_date, end_date):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    from refraction_model import estimate_pressure_from_elevation, refraction_at_horizon
+    from weather import load_temperatures_from_csv, get_temperature, FALLBACK_TEMP_C
+
     config = SolarCalcConfig(
         dtm_file="/Users/aleksandertjernes/downloads/DTM10_UTM32_20250307/6606_4_10m_z32.tif",
         observer_lat=60.2889842362621,
@@ -499,6 +514,7 @@ if __name__ == "__main__":
         timezone="Europe/Oslo",
         start_date=date(2025, 1, 1),
         end_date=date(2025, 12, 31),
+        temperature_file="temperatures.csv",  # Optional: path to sensor CSV
     )
 
     # 1) Compute horizon profile
@@ -511,15 +527,42 @@ if __name__ == "__main__":
         max_distance=config.max_distance,
     )
 
-    # 2) Timezone
+    # 2) Load temperature data from local sensor CSV (if available)
+    daily_temps = {}
+    if config.temperature_file:
+        try:
+            daily_temps = load_temperatures_from_csv(config.temperature_file)
+            print(f"Loaded {len(daily_temps)} temperature readings from {config.temperature_file}")
+        except Exception as e:
+            print(f"Warning: Could not load temperature file: {e}")
+            print(f"Using fallback temperature {FALLBACK_TEMP_C}°C for all days.")
+
+    # 3) Estimate atmospheric pressure from observer elevation (once)
+    obs_elevation = config.observer_elev if config.observer_elev is not None else 0.0
+    pressure_hpa = estimate_pressure_from_elevation(
+        elevation_m=obs_elevation,
+        temperature_c=15.0  # Standard assumption for pressure estimation
+    )
+    print(f"Estimated pressure at {obs_elevation}m: {pressure_hpa:.2f} hPa")
+
+    # 4) Timezone
     oslo_tz = zoneinfo.ZoneInfo(config.timezone)
 
-    # 3) Iterate over all days and collect results
+    # 5) Iterate over all days and collect results
     num_days = (config.end_date - config.start_date).days + 1
 
     results = []
     for d in range(num_days):
         current_date = config.start_date + timedelta(days=d)
+
+        # Get temperature for this day from sensor data (or use fallback)
+        temp_c = get_temperature(daily_temps, current_date, FALLBACK_TEMP_C)
+
+        # Compute temperature-dependent refraction for this day
+        refraction_deg = refraction_at_horizon(
+            temperature_c=temp_c,
+            pressure_hpa=pressure_hpa
+        )
 
         sunrise_utc, sunset_utc = find_sunrise_sunset(
             observer_lat=config.observer_lat,
@@ -529,6 +572,7 @@ if __name__ == "__main__":
             horizon_az=az,
             horizon_alt=hor_alt,
             target_date=current_date,
+            refraction_deg=refraction_deg,
         )
 
         sunrise_local_str = to_local_str(sunrise_utc, oslo_tz)
@@ -545,7 +589,7 @@ if __name__ == "__main__":
         }
         results.append(row_data)
 
-    # 4) Print sample + export
+    # 6) Print sample + export
     for row in results[:10]:
         print(row)
 
