@@ -327,7 +327,7 @@ def find_sunrise_sunset(
     horizon_az: np.ndarray,
     horizon_alt: np.ndarray,
     target_date: date,
-    refraction_deg: float = 0.575
+    refraction_deg: float = 0.575  # 34.5 arcmin standard refraction at 10°C, 1013.25 hPa
 ):
     """
     Computes local sunrise and sunset times given a horizon profile.
@@ -340,7 +340,7 @@ def find_sunrise_sunset(
         horizon_az: Array of azimuth angles in degrees
         horizon_alt: Array of horizon altitude angles in degrees
         target_date: Date for which to compute sunrise/sunset
-        refraction_deg: Atmospheric refraction angle in degrees
+        refraction_deg: Atmospheric refraction angle in degrees (default: 0.575° = 34.5')
 
     Returns:
         (sunrise_utc, sunset_utc) — datetimes in UTC, or
